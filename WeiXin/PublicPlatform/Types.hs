@@ -7,7 +7,7 @@ module WeiXin.PublicPlatform.Types
     , UrlText(..)
     ) where
 
-import ClassyPrelude hiding (FilePath, (<.>), (</>), try)
+import ClassyPrelude hiding (try, optional)
 import Data.SafeCopy
 import Data.Aeson                           as A
 import qualified Data.Text                  as T
@@ -15,29 +15,35 @@ import Data.Aeson.Types                     (Parser, Pair, typeMismatch)
 import qualified Data.ByteString.Base64     as B64
 import qualified Data.ByteString.Char8      as C8
 import qualified Data.ByteString.Lazy       as LB
+import qualified Data.Set                   as Set
 import Data.Byteable                        (toBytes)
+import Data.Char                            (isSpace)
 import Crypto.Cipher                        (makeKey, Key)
 import Crypto.Cipher.AES                    (AES)
 import Data.Time                            (addUTCTime, NominalDiffTime)
 import Data.Scientific                      (toBoundedInteger)
 import Text.Read                            (reads)
-import Filesystem.Path.CurrentOS            (encodeString, fromText, FilePath)
 import qualified Crypto.Hash.MD5            as MD5
+import qualified Crypto.Hash.SHA256         as SHA256
 import Database.Persist.Sql                 (PersistField(..), PersistFieldSql(..)
                                             , SqlType(..))
 import Database.Persist                     (PersistValue)
 import Yesod.Core                           (PathPiece(..))
 import Text.Read                            (Read(..))
 import Data.Proxy                           (Proxy(..))
+import Language.Haskell.TH.Lift             (deriveLift)
 
-import Yesod.Helpers.Aeson                  (parseArray)
+import Yesod.Helpers.Aeson                  (parseArray, parseIntWithTextparsec, parseTextByParsec)
+import Yesod.Helpers.Utils                  (emptyTextToNothing)
 import Yesod.Helpers.Types                  (Gender(..), UrlText(..), unUrlText)
-import Yesod.Helpers.Parsec                 ( SimpleStringRep(..)
+import Yesod.Helpers.Parsec                 ( SimpleStringRep(..), natural
                                             , derivePersistFieldS, makeSimpleParserByTable
-                                            , deriveJsonS
+                                            , deriveJsonS, derivePathPieceS
                                             )
+import Data.Byteable                        (Byteable(..))
 import Text.Parsec
 import qualified Data.HashMap.Strict        as HM
+import Data.List.NonEmpty                   (NonEmpty(..), nonEmpty)
 
 import WeiXin.PublicPlatform.Utils
 
@@ -52,6 +58,10 @@ newtype WxppUserGroupID = WxppUserGroupID { unWxppUserGroupID :: Int }
                         deriving (Show, Eq, Ord, ToJSON, FromJSON)
 
 
+-- | 卡券ID
+newtype WxCardID = WxCardID { unWxCardID :: Text }
+                    deriving (Show, Eq, Ord, ToJSON, FromJSON, PersistField, PersistFieldSql)
+
 -- | 客服帐号
 newtype WxppKfAccount = WxppKfAccount { unWxppKfAccount :: Text }
                         deriving (Show, Eq, Ord)
@@ -62,8 +72,9 @@ newtype WxppBriefMediaID = WxppBriefMediaID { unWxppBriefMediaID :: Text }
                         deriving (Show, Eq, Ord)
 
 instance SafeCopy WxppBriefMediaID where
-    getCopy                         = contain $ safeGet
+    getCopy                         = contain $ WxppBriefMediaID <$> safeGet
     putCopy (WxppBriefMediaID x)    = contain $ safePut x
+    errorTypeName _                 = "WxppBriefMediaID"
 
 instance PersistField WxppBriefMediaID where
     toPersistValue      = toPersistValue . unWxppBriefMediaID
@@ -82,11 +93,12 @@ instance FromJSON WxppBriefMediaID where
 -- | 为区分临时素材和永久素材，这个值专指 永久素材
 -- 虽然文档叫这种值 media id，但接口用的词是 material
 newtype WxppDurableMediaID = WxppDurableMediaID { unWxppDurableMediaID :: Text }
-                        deriving (Show, Eq, Ord)
+                        deriving (Show, Eq, Ord, Read)
 
 instance SafeCopy WxppDurableMediaID where
-    getCopy                         = contain $ safeGet
+    getCopy                         = contain $ WxppDurableMediaID <$> safeGet
     putCopy (WxppDurableMediaID x)  = contain $ safePut x
+    errorTypeName _                 = "WxppDurableMediaID"
 
 instance PersistField WxppDurableMediaID where
     toPersistValue      = toPersistValue . unWxppDurableMediaID
@@ -101,10 +113,14 @@ instance ToJSON WxppDurableMediaID where
 instance FromJSON WxppDurableMediaID where
     parseJSON = fmap WxppDurableMediaID . parseJSON
 
+instance PathPiece WxppDurableMediaID where
+    fromPathPiece = fmap WxppDurableMediaID . fromPathPiece
+    toPathPiece = toPathPiece . unWxppDurableMediaID
 
 -- | 代表永久或临时的素材ID
 newtype WxppMediaID = WxppMediaID { unWxppMediaID :: Text }
                     deriving (Show, Eq)
+$(deriveLift ''WxppMediaID)
 
 fromWxppBriefMediaID :: WxppBriefMediaID -> WxppMediaID
 fromWxppBriefMediaID = WxppMediaID . unWxppBriefMediaID
@@ -125,6 +141,7 @@ newtype WxppOpenID = WxppOpenID { unWxppOpenID :: Text}
 instance SafeCopy WxppOpenID where
     getCopy                 = contain $ WxppOpenID <$> safeGet
     putCopy (WxppOpenID x)  = contain $ safePut x
+    errorTypeName _         = "WxppOpenID"
 
 instance PersistField WxppOpenID where
     toPersistValue      = toPersistValue . unWxppOpenID
@@ -141,7 +158,10 @@ instance FromJSON WxppOpenID where
 
 instance PathPiece WxppOpenID where
     toPathPiece (WxppOpenID x)  = toPathPiece x
-    fromPathPiece t             = WxppOpenID <$> fromPathPiece t
+    fromPathPiece t             =   let t' = T.strip t
+                                    in if T.null t'
+                                          then Nothing
+                                          else WxppOpenID <$> fromPathPiece t'
 
 newtype WxppUnionID = WxppUnionID { unWxppUnionID :: Text }
                     deriving (Show, Read, Eq, Ord, Typeable)
@@ -155,6 +175,7 @@ instance ToJSON WxppUnionID where
 instance SafeCopy WxppUnionID where
     getCopy                 = contain $ WxppUnionID <$> safeGet
     putCopy (WxppUnionID x) = contain $ safePut x
+    errorTypeName _         = "WxppUnionID"
 
 instance PersistField WxppUnionID where
     toPersistValue      = toPersistValue . unWxppUnionID
@@ -294,7 +315,10 @@ decodeBase64Encoded = B64.decode . encodeUtf8
 
 decodeBase64AesKey :: Text -> Either String AesKey
 decodeBase64AesKey t = fmap AesKey $ do
-    decodeBase64Encoded t >>= either (Left . show) Right . makeKey
+    decodeBase64Encoded t' >>= either (Left . show) Right . makeKey
+    where
+        -- 相比标准的 base64 微信显示的 AesKey 少了补位的等号
+        t' = t <> T.replicate (4 - length t `rem` 4) "="
 
 parseAesKeyFromText :: Text -> Parser AesKey
 parseAesKeyFromText t = either fail return $ decodeBase64AesKey t
@@ -314,6 +338,7 @@ newtype WxppAppID = WxppAppID { unWxppAppID :: Text }
 instance SafeCopy WxppAppID where
     getCopy                 = contain $ WxppAppID <$> safeGet
     putCopy (WxppAppID x)   = contain $ safePut x
+    errorTypeName _         = "WxppAppID"
 
 instance PersistField WxppAppID where
     toPersistValue      = toPersistValue . unWxppAppID
@@ -324,7 +349,10 @@ instance PersistFieldSql WxppAppID where
 
 instance PathPiece WxppAppID where
     toPathPiece (WxppAppID x)   = toPathPiece x
-    fromPathPiece t             = WxppAppID <$> fromPathPiece t
+    fromPathPiece t             =   let t' = T.strip t
+                                    in if T.null t'
+                                          then Nothing
+                                          else WxppAppID <$> fromPathPiece t'
 
 instance ToJSON WxppAppID where toJSON = toJSON . unWxppAppID
 
@@ -362,7 +390,7 @@ newtype WxppAppSecret = WxppAppSecret { unWxppAppSecret :: Text }
                     deriving (Show, Eq, PersistFieldSql, PersistField)
 
 data WxppAppConfig = WxppAppConfig {
-                    wxppAppConfigAppID         :: WxppAppID
+                    wxppConfigAppID         :: WxppAppID
                     , wxppConfigAppSecret   :: WxppAppSecret
                     , wxppConfigAppToken    :: Token
                     , wxppConfigAppAesKey   :: Maybe AesKey
@@ -370,16 +398,24 @@ data WxppAppConfig = WxppAppConfig {
                         -- ^ 多个 aes key 是为了过渡时使用
                         -- 加密时仅使用第一个
                         -- 解密时则则所有都试一次
-                    , wxppAppConfigDataDir  :: FilePath
+                    , wxppAppConfigDataDir  :: NonEmpty FilePath
                     }
                     deriving (Show, Eq)
+
+-- | for backward-compatibility
+wxppAppConfigAppID :: WxppAppConfig -> WxppAppID
+wxppAppConfigAppID = wxppConfigAppID
 
 instance FromJSON WxppAppConfig where
     parseJSON = withObject "WxppAppConfig" $ \obj -> do
                     app_id <- fmap WxppAppID $ obj .: "app-id"
                     secret <- fmap WxppAppSecret $ obj .: "secret"
                     app_token <- fmap Token $ obj .: "token"
-                    data_dir <- fromText <$> obj .: "data-dir"
+                    data_dirs <- map T.unpack <$> obj .: "data-dirs"
+                    data_dirs' <- case nonEmpty data_dirs of
+                                    Nothing -> fail "data-dirs must not be empty"
+                                    Just x -> return x
+
                     aes_key_lst <- obj .: "aes-key"
                                     >>= return . filter (not . T.null) . map T.strip
                                     >>= mapM parseAesKeyFromText
@@ -391,7 +427,7 @@ instance FromJSON WxppAppConfig where
                     return $ WxppAppConfig app_id secret app_token
                                 ak1
                                 backup_aks
-                                data_dir
+                                data_dirs'
 
 
 -- | 见高级群发接口文档
@@ -544,10 +580,12 @@ instance FromJSON WxppEvent where
 data WxppInMsg =  WxppInMsgText Text
                     -- ^ 文本消息
                 | WxppInMsgImage WxppBriefMediaID UrlText
-                    -- ^ 消息
+                    -- ^ 图片消息 media_id url
                 | WxppInMsgVoice WxppBriefMediaID Text (Maybe Text)
                     -- ^ format recognition
                 | WxppInMsgVideo WxppBriefMediaID WxppBriefMediaID
+                    -- ^ media_id, thumb_media_id
+                | WxppInMsgShortVideo WxppBriefMediaID WxppBriefMediaID
                     -- ^ media_id, thumb_media_id
                 | WxppInMsgLocation (Double, Double) Double Text
                     -- ^ (latitude, longitude) scale label
@@ -561,6 +599,7 @@ wxppInMsgTypeString (WxppInMsgText {})      = "text"
 wxppInMsgTypeString (WxppInMsgImage {})     = "image"
 wxppInMsgTypeString (WxppInMsgVoice {})     = "voice"
 wxppInMsgTypeString (WxppInMsgVideo {})     = "video"
+wxppInMsgTypeString (WxppInMsgShortVideo {}) = "shortvideo"
 wxppInMsgTypeString (WxppInMsgLocation {})  = "location"
 wxppInMsgTypeString (WxppInMsgLink {})      = "link"
 wxppInMsgTypeString (WxppInMsgEvent {})     = "event"
@@ -581,6 +620,11 @@ instance ToJSON WxppInMsg where
                                                     ]
 
         get_others (WxppInMsgVideo media_id thumb_media_id) =
+                                                    [ "media_id"        .= media_id
+                                                    , "thumb_media_id"  .= thumb_media_id
+                                                    ]
+
+        get_others (WxppInMsgShortVideo media_id thumb_media_id) =
                                                     [ "media_id"        .= media_id
                                                     , "thumb_media_id"  .= thumb_media_id
                                                     ]
@@ -613,11 +657,15 @@ instance FromJSON WxppInMsg where
         "voice" -> liftM3 WxppInMsgVoice
                     (obj .: "media_id")
                     (obj .: "format")
-                    (obj .:? "recognition")
+                    (join . fmap emptyTextToNothing <$> obj .:? "recognition")
 
         "video" -> liftM2 WxppInMsgVideo
                     (obj .: "media_id")
                     (obj .: "thumb_media_id")
+
+        "shortvideo" -> liftM2 WxppInMsgShortVideo
+                            (obj .: "media_id")
+                            (obj .: "thumb_media_id")
 
         "location" -> liftM3 WxppInMsgLocation
                         (liftM2 (,) (obj .: "latitude") (obj .: "longitude"))
@@ -670,6 +718,7 @@ data WxppArticle = WxppArticle {
                     , wxppArticleUrl    :: Maybe UrlText -- ^ url
                     }
                     deriving (Show, Eq)
+$(deriveLift ''WxppArticle)
 
 instance ToJSON WxppArticle where
     toJSON wa = object
@@ -683,10 +732,10 @@ type WxppArticleLoader = DelayedYamlLoader WxppArticle
 
 instance FromJSON WxppArticle where
     parseJSON = withObject "WxppArticle" $ \obj -> do
-                title <- obj .:? "title"
-                desc <- obj .:? "desc"
-                pic_url <- fmap UrlText <$> obj .:? "pic-url"
-                url <- fmap UrlText <$> obj .:? "url"
+                title <- join . fmap emptyTextToNothing <$> obj .:? "title"
+                desc <- join . fmap emptyTextToNothing <$> obj .:? "desc"
+                pic_url <- fmap UrlText <$> join . fmap emptyTextToNothing <$> obj .:? "pic-url"
+                url <- fmap UrlText <$> join . fmap emptyTextToNothing <$> obj .:? "url"
                 return $ WxppArticle title desc pic_url url
 
 -- | 外发的信息
@@ -707,6 +756,8 @@ data WxppOutMsg = WxppOutMsgText Text
                 | WxppOutMsgTransferToCustomerService
                     -- ^ 把信息转发至客服
                 deriving (Show, Eq)
+
+$(deriveLift ''WxppOutMsg)
 
 wxppOutMsgTypeString :: IsString a => WxppOutMsg -> a
 wxppOutMsgTypeString (WxppOutMsgText {})                    = "text"
@@ -742,7 +793,7 @@ instance ToJSON WxppOutMsg where
 
 instance FromJSON WxppOutMsg where
     parseJSON = withObject "WxppOutMsg" $ \obj -> do
-      typ <- obj .: "type"
+      typ <- obj .:? "type" .!= "text"
       case (typ :: String) of
           "text"  -> WxppOutMsgText <$> obj .: "text"
           "image" -> WxppOutMsgImage <$> obj .: "media_id"
@@ -751,15 +802,15 @@ instance FromJSON WxppOutMsg where
           "video" -> liftM4 WxppOutMsgVideo
                         (obj .: "media_id")
                         (obj .: "thumb_media_id")
-                        (obj .:? "title")
-                        (obj .:? "desc")
+                        (join . fmap emptyTextToNothing <$> obj .:? "title")
+                        (join . fmap emptyTextToNothing <$> obj .:? "desc")
 
           "music" -> liftM5 WxppOutMsgMusic
                         (obj .: "thumb_media_id")
-                        (obj .:? "title")
-                        (obj .:? "desc")
-                        (fmap UrlText <$> obj .:? "url")
-                        (fmap UrlText <$> obj .:? "hq_url")
+                        (join . fmap emptyTextToNothing <$> obj .:? "title")
+                        (join . fmap emptyTextToNothing <$> obj .:? "desc")
+                        (fmap UrlText <$> join . fmap emptyTextToNothing <$> obj .:? "url")
+                        (fmap UrlText <$> join . fmap emptyTextToNothing <$> obj .:? "hq_url")
 
           "news" -> WxppOutMsgNews <$> obj .: "articles"
 
@@ -792,20 +843,22 @@ instance FromJSON WxppOutMsgL where
                     type_s <- obj .:? "type" .!= "text"
                     case type_s of
                         "text" -> WxppOutMsgTextL <$> obj .: "text"
-                        "image" -> WxppOutMsgImageL . fromText <$> obj .: "path"
-                        "voice" -> WxppOutMsgVoiceL . fromText <$> obj .: "path"
+                        "image" -> WxppOutMsgImageL . T.unpack <$> obj .: "path"
+                        "voice" -> WxppOutMsgVoiceL . T.unpack <$> obj .: "path"
                         "video" -> do
-                                    path <- fromText <$> obj .: "path"
-                                    path2 <- fmap fromText <$> obj .:? "thumb-image"
+                                    path <- T.unpack <$> obj .: "path"
+                                    path2 <- fmap T.unpack <$> obj .:? "thumb-image"
                                     title <- obj .:? "title"
                                     desc <- obj .:? "desc"
                                     return $ WxppOutMsgVideoL path path2 title desc
                         "music" -> do
-                                    path <- fromText <$> obj .: "thumb-image"
+                                    path <- T.unpack <$> obj .: "thumb-image"
                                     title <- obj .:? "title"
                                     desc <- obj .:? "desc"
-                                    url <- fmap UrlText <$> obj .:? "url"
-                                    hq_url <- fmap UrlText <$> obj .:? "hq-url"
+                                    url <- fmap UrlText <$> join . fmap emptyTextToNothing <$>
+                                                obj .:? "url"
+                                    hq_url <- fmap UrlText <$> join . fmap emptyTextToNothing <$>
+                                                obj .:? "hq-url"
                                     return $ WxppOutMsgMusicL path title desc url hq_url
 
                         "news" -> WxppOutMsgNewsL <$>
@@ -830,38 +883,48 @@ data WxppDurableArticle = WxppDurableArticle {
                                 , wxppDurableArticleDigest         :: Maybe Text
                                 , wxppDurableArticleShowCoverPic   :: Bool
                                 , wxppDurableArticleContent        :: Text
-                                , wxppDurableArticleContentSrcUrl  :: UrlText
+                                , wxppDurableArticleContentSrcUrl  :: Maybe UrlText
                             }
-                            deriving (Eq)
+                            deriving (Eq, Ord, Show)
+
+$(deriveSafeCopy 0 'base ''WxppDurableArticle)
 
 instance FromJSON WxppDurableArticle where
     parseJSON = withObject "WxppDurableArticle" $ \obj -> do
                     WxppDurableArticle
                         <$> ( obj .: "title" )
                         <*> ( obj .: "thumb_media_id" )
-                        <*> ( obj .:? "author" )
-                        <*> ( obj .:? "digest" )
-                        <*> ( int_to_bool <$> obj .: "show_cover_pic" )
+                        <*> ( join . fmap emptyTextToNothing <$> obj .:? "author" )
+                        <*> ( join . fmap emptyTextToNothing <$> obj .:? "digest" )
+                        <*> ( fmap int_to_bool $ obj .: "show_cover_pic"
+                                                    >>= parseIntWithTextparsec natural )
                         <*> ( obj .: "content" )
-                        <*> ( UrlText <$> obj .: "content_source_url" )
+                        <*> ( fmap UrlText . join . fmap emptyTextToNothing <$> obj .: "content_source_url" )
             where
-                int_to_bool x = (x :: Int) /= 0
+                int_to_bool x = x /= 0
 
 
 instance ToJSON WxppDurableArticle where
-    toJSON x = object   [ "title"           .= wxppDurableArticleTitle x
+    toJSON = object . wppDurableArticleToJsonPairs
+
+
+wppDurableArticleToJsonPairs :: WxppDurableArticle -> [Pair]
+wppDurableArticleToJsonPairs x =
+                        [ "title"           .= wxppDurableArticleTitle x
                         , "thumb_media_id"  .= wxppDurableArticleThumb x
                         , "author"          .= (fromMaybe "" $ wxppDurableArticleAuthor x)
                         , "digest"          .= (fromMaybe "" $ wxppDurableArticleDigest x)
-                        , "show_cover_pic"  .= bool_to_int (wxppDurableArticleShowCoverPic x)
+                        , "show_cover_pic"  .= (show $ bool_to_int $ wxppDurableArticleShowCoverPic x)
                         , "content"         .= wxppDurableArticleContent x
-                        , "content_source_url" .= unUrlText (wxppDurableArticleContentSrcUrl x)
+                        , "content_source_url" .= (fromMaybe "" $ fmap unUrlText $ wxppDurableArticleContentSrcUrl x)
                         ]
             where
                 bool_to_int b = if b then 1 :: Int else 0
 
+
 -- | 永久图文素材结构
 newtype WxppDurableNews = WxppDurableNews [WxppDurableArticle]
+                        deriving (Eq, Ord)
 
 instance FromJSON WxppDurableNews where
     parseJSON = withObject "WxppDurableNews" $ \obj -> do
@@ -881,6 +944,8 @@ data WxppMediaType = WxppMediaTypeImage
 deriveSafeCopy 0 'base ''WxppMediaType
 
 $(derivePersistFieldS "WxppMediaType")
+$(derivePathPieceS "WxppMediaType")
+$(deriveJsonS "WxppMediaType")
 
 instance SimpleStringRep WxppMediaType where
     simpleEncode mtype =
@@ -1014,6 +1079,7 @@ data SimpleLocaleName = SimpleLocaleName { unSimpleLocaleName :: Text }
 instance SafeCopy SimpleLocaleName where
     getCopy                         = contain $ SimpleLocaleName <$> safeGet
     putCopy (SimpleLocaleName x)    = contain $ safePut x
+    errorTypeName _                 = "SimpleLocaleName"
 
 instance PersistField SimpleLocaleName where
     toPersistValue      = toPersistValue . unSimpleLocaleName
@@ -1031,13 +1097,13 @@ type CountryName = Text
 data EndUserQueryResult = EndUserQueryResultNotSubscribed WxppOpenID
                         | EndUserQueryResult
                             WxppOpenID
-                            NickName    -- ^ nickname
+                            NickName    -- nickname
                             (Maybe Gender)
                             SimpleLocaleName
                             CityName
                             ProvinceName
                             CountryName
-                            UrlText     -- ^ head image url
+                            UrlText     -- head image url
                             UTCTime
                             (Maybe WxppUnionID)
                         deriving (Show, Eq, Ord, Typeable)
@@ -1060,6 +1126,10 @@ endUserQueryResultSetUnionID m_uid (EndUserQueryResult x1 x2 x3 x4 x5 x6 x7 x8 x
 endUserQueryResultSubsTime :: EndUserQueryResult -> Maybe UTCTime
 endUserQueryResultSubsTime (EndUserQueryResultNotSubscribed {})             = Nothing
 endUserQueryResultSubsTime (EndUserQueryResult _ _ _ _ _ _ _ _ subs_time _) = Just subs_time
+
+endUserQueryResultNickname :: EndUserQueryResult -> Maybe NickName
+endUserQueryResultNickname (EndUserQueryResultNotSubscribed {})     = Nothing
+endUserQueryResultNickname (EndUserQueryResult _ x _ _ _ _ _ _ _ _) = Just x
 
 instance FromJSON EndUserQueryResult where
     parseJSON = withObject "EndUserQueryResult" $ \obj -> do
@@ -1139,8 +1209,9 @@ newtype MD5Hash = MD5Hash { unMD5Hash :: ByteString }
                 deriving (Show, Eq, Ord)
 
 instance SafeCopy MD5Hash where
-    getCopy             = contain $ safeGet
+    getCopy             = contain $ MD5Hash <$> safeGet
     putCopy (MD5Hash x) = contain $ safePut x
+    errorTypeName _     = "MD5Hash"
 
 instance PersistField MD5Hash where
     toPersistValue      = toPersistValue . unMD5Hash
@@ -1148,6 +1219,32 @@ instance PersistField MD5Hash where
 
 instance PersistFieldSql MD5Hash where
     sqlType _ = SqlBlob
+
+instance Byteable MD5Hash where
+    toBytes (MD5Hash x) = toBytes x
+    byteableLength (MD5Hash x) = byteableLength x
+    withBytePtr (MD5Hash x) f = withBytePtr x f
+
+
+newtype SHA256Hash = SHA256Hash { unSHA256Hash :: ByteString }
+                deriving (Show, Eq, Ord)
+
+instance SafeCopy SHA256Hash where
+    getCopy             = contain $ SHA256Hash <$> safeGet
+    putCopy (SHA256Hash x) = contain $ safePut x
+    errorTypeName _     = "SHA256Hash"
+
+instance PersistField SHA256Hash where
+    toPersistValue      = toPersistValue . unSHA256Hash
+    fromPersistValue    = fmap SHA256Hash . fromPersistValue
+
+instance PersistFieldSql SHA256Hash where
+    sqlType _ = SqlBlob
+
+instance Byteable SHA256Hash where
+    toBytes (SHA256Hash x) = toBytes x
+    byteableLength (SHA256Hash x) = byteableLength x
+    withBytePtr (SHA256Hash x) f = withBytePtr x f
 
 -- | 上传媒体文件的结果
 data UploadResult = UploadResult {
@@ -1190,75 +1287,208 @@ instance FromJSON WxppForwardedEnv where
                     WxppForwardedEnv    <$> ( obj .: "user_info" )
                                         <*> ( obj .: "access_token" )
 
+data OAuthScope = AS_SnsApiBase
+                | AS_SnsApiUserInfo
+                | AS_Unknown Text
+                deriving (Show, Eq, Ord)
 
--- | WXPP 服务器所需的一切 cache 接口
--- 实际cache可以用各种后端，包括acid-state，各种数据库等等
-class WxppCacheBackend a where
-    -- | get the lastest available access token
-    wxppCacheGetAccessToken ::
-        a
-        -> WxppAppID
-        -> IO (Maybe (AccessToken, UTCTime))
-                -- ^ access toke and expiry time
+$(derivePersistFieldS "OAuthScope")
+$(derivePathPieceS "OAuthScope")
+$(deriveSafeCopy 0 'base ''OAuthScope)
 
-    -- | save a access token
-    wxppCacheAddAccessToken ::
-        a
-        -> AccessToken
-        -> UTCTime      -- ^ expiry time
-        -> IO ()
+instance SimpleStringRep OAuthScope where
+    -- Encode values will be used in wxppAuthPageUrl
+    -- so they must be consistent with WX doc.
+    simpleEncode AS_SnsApiBase      = "snsapi_base"
+    simpleEncode AS_SnsApiUserInfo  = "snsapi_userinfo"
+    simpleEncode (AS_Unknown s)     = T.unpack s
 
-    wxppCachePurgeAccessToken ::
-        a
-        -> UTCTime      -- ^ expiry time
-        -> IO ()
+    simpleParser = try p Text.Parsec.<|> parse_unknown
+        where
+            p = makeSimpleParserByTable
+                    [ ("snsapi_base", AS_SnsApiBase)
+                    , ("snsapi_userinfo", AS_SnsApiUserInfo)
+                    ]
 
-    wxppCacheLookupUserInfo ::
-        a
-        -> WxppAppID
-        -> WxppOpenID
-        -> IO (Maybe (EndUserQueryResult, UTCTime))
-
-    wxppCacheSaveUserInfo ::
-        a
-        -> WxppAppID
-        -> EndUserQueryResult
-        -> IO ()
-
-    wxppCacheLookupUploadedMediaIDByHash ::
-        a
-        -> WxppAppID
-        -> MD5Hash
-        -> IO (Maybe UploadResult)
-
-    wxppCacheSaveUploadedMediaID ::
-        a
-        -> WxppAppID
-        -> MD5Hash
-        -> UploadResult
-        -> IO ()
+            parse_unknown = fmap (AS_Unknown . fromString) $
+                                many1 $ satisfy $ not . isSpace
 
 
-wxppGetUsableAccessToken :: (MonadIO m, WxppCacheBackend c) =>
-    c -> WxppAppID -> m (Maybe (AccessToken, UTCTime))
-wxppGetUsableAccessToken cache app_id = liftIO $ do
-    now <- getCurrentTime
-    fmap (join . (fmap $ \x -> if snd x > now then Just x else Nothing)) $
-        wxppCacheGetAccessToken cache app_id
+newtype OAuthCode = OAuthCode { unOAuthCode :: Text }
+                    deriving (Eq, Ord, Show, PersistField, PersistFieldSql)
+
+instance PathPiece OAuthCode where
+    fromPathPiece = fmap OAuthCode . fromPathPiece
+    toPathPiece = toPathPiece . unOAuthCode
+
+instance ToJSON OAuthCode where toJSON = toJSON . unOAuthCode
 
 
-data SomeWxppCacheBackend = forall a. WxppCacheBackend a => SomeWxppCacheBackend a
+newtype OAuthAccessToken = OAuthAccessToken { unOAuthAccessToken :: Text }
+                        deriving (Eq, Ord, Show, PersistField, PersistFieldSql)
 
-instance WxppCacheBackend SomeWxppCacheBackend where
-    wxppCacheGetAccessToken (SomeWxppCacheBackend x)    = wxppCacheGetAccessToken x
-    wxppCacheAddAccessToken (SomeWxppCacheBackend x)    = wxppCacheAddAccessToken x
-    wxppCachePurgeAccessToken (SomeWxppCacheBackend x)  = wxppCachePurgeAccessToken x
-    wxppCacheLookupUserInfo (SomeWxppCacheBackend x)    = wxppCacheLookupUserInfo x
-    wxppCacheSaveUserInfo   (SomeWxppCacheBackend x)    = wxppCacheSaveUserInfo x
-    wxppCacheLookupUploadedMediaIDByHash
-                            (SomeWxppCacheBackend x)    = wxppCacheLookupUploadedMediaIDByHash x
-    wxppCacheSaveUploadedMediaID
-                            (SomeWxppCacheBackend x)    = wxppCacheSaveUploadedMediaID x
+instance SafeCopy OAuthAccessToken where
+    getCopy                      = contain $ OAuthAccessToken <$> safeGet
+    putCopy (OAuthAccessToken x) = contain $ safePut x
+    errorTypeName _              = "OAuthAccessToken"
+
+instance PathPiece OAuthAccessToken where
+    fromPathPiece = fmap OAuthAccessToken . fromPathPiece
+    toPathPiece = toPathPiece . unOAuthAccessToken
+
+instance FromJSON OAuthAccessToken where
+    parseJSON = fmap OAuthAccessToken . parseJSON
+
+
+newtype OAuthRefreshToken = OAuthRefreshToken { unOAuthRefreshToken :: Text }
+                            deriving (Eq, Ord, Show, PersistField, PersistFieldSql)
+
+instance SafeCopy OAuthRefreshToken where
+    getCopy                       = contain $ OAuthRefreshToken <$> safeGet
+    putCopy (OAuthRefreshToken x) = contain $ safePut x
+    errorTypeName _               = "OAuthRefreshToken"
+
+instance PathPiece OAuthRefreshToken where
+    fromPathPiece = fmap OAuthRefreshToken . fromPathPiece
+    toPathPiece = toPathPiece . unOAuthRefreshToken
+
+instance FromJSON OAuthRefreshToken where parseJSON = fmap OAuthRefreshToken . parseJSON
+
+instance ToJSON OAuthRefreshToken where toJSON = toJSON . unOAuthRefreshToken
+
+-- | access token 通常要与 open id 一起使用，并且有对应关系，因此打包在一起
+data OAuthAccessTokenPkg = OAuthAccessTokenPkg {
+                            oauthAtkPRaw        :: OAuthAccessToken
+                            , oauthAtkPRtk      :: OAuthRefreshToken
+                            , oauthAtkPScopes   :: Set OAuthScope
+                            , oauthAtkPState    :: Text
+                            , oauthAtkPOpenID   :: WxppOpenID
+                            , oauthAtkPAppID    :: WxppAppID
+                            }
+                            deriving (Eq, Ord, Show)
+
+$(deriveSafeCopy 0 'base ''OAuthAccessTokenPkg)
+
+data OAuthTokenInfo = OAuthTokenInfo
+                        !OAuthAccessToken
+                        !OAuthRefreshToken
+                        !(Set OAuthScope)
+                        !Text   -- ^ state
+                        !UTCTime
+                        deriving (Show, Typeable, Eq, Ord)
+$(deriveSafeCopy 0 'base ''OAuthTokenInfo)
+
+packOAuthTokenInfo :: WxppAppID
+                    -> WxppOpenID
+                    -> OAuthTokenInfo
+                    -> OAuthAccessTokenPkg
+packOAuthTokenInfo app_id open_id (OAuthTokenInfo atk rtk scopes m_state _expiry) =
+    OAuthAccessTokenPkg atk rtk scopes m_state open_id app_id
+
+
+data OAuthAccessTokenResult = OAuthAccessTokenResult {
+                                oauthAtkToken           :: OAuthAccessToken
+                                , oauthAtkTTL           :: NominalDiffTime
+                                , oauthAtkScopes        :: Set OAuthScope
+                                , oauthAtkRefreshToken  :: OAuthRefreshToken
+                                , oauthAtkOpenID        :: WxppOpenID
+                                , oauthAtkUnionID       :: Maybe WxppUnionID
+                                }
+                                deriving (Eq, Show)
+
+instance FromJSON OAuthAccessTokenResult where
+    parseJSON = withObject "OAuthAccessTokenResult" $ \o -> do
+                    OAuthAccessTokenResult
+                        <$> o .: "access_token"
+                        <*> ((fromIntegral :: Int -> NominalDiffTime) <$> o .: "expires_in")
+                        <*> (fmap Set.fromList $ o .: "scope" >>= parseTextByParsec p_scopes)
+                        <*> o .: "refresh_token"
+                        <*> o .: "openid"
+                        <*> (fmap WxppUnionID . join . fmap emptyTextToNothing <$> o .:? "unionid")
+                where
+                    p_scopes = simpleParser `sepBy1` (spaces *> char ',' <* spaces)
+
+
+data OAuthRefreshAccessTokenResult = OAuthRefreshAccessTokenResult {
+                                        oauthRtkToken           :: OAuthAccessToken
+                                        , oauthRtkTTL           :: NominalDiffTime
+                                        , oauthRtkScopes        :: Set OAuthScope
+                                        , ouahtRtkRefreshToken  :: OAuthRefreshToken
+                                        , oauthRtkOpenID        :: WxppOpenID
+                                        }
+                                        deriving (Eq, Show)
+
+instance FromJSON OAuthRefreshAccessTokenResult where
+    parseJSON = withObject "OAuthRefreshAccessTokenResult" $ \o -> do
+                    OAuthRefreshAccessTokenResult
+                        <$> o .: "access_token"
+                        <*> ((fromIntegral :: Int -> NominalDiffTime) <$> o .: "expires_in")
+                        <*> (fmap Set.fromList $ o .: "scope" >>= parseTextByParsec p_scopes)
+                        <*> o .: "refresh_token"
+                        <*> o .: "openid"
+                where
+                    p_scopes = simpleParser `sepBy1` (spaces *> char ',' <* spaces)
+
+data OAuthGetUserInfoResult = OAuthGetUserInfoResult {
+                                oauthUserInfoOpenID         :: WxppOpenID
+                                , oauthUserInfoNickname     :: Text
+                                , oauthUserInfoGender       :: Maybe Gender
+                                , oauthUserInfoCountry      :: Text
+                                , oauthUserInfoProvince     :: Text
+                                , oauthUserInfoCity         :: Text
+                                , oauthUserInfoHeadImgUrl   :: Maybe UrlText
+                                , oauthUserInfoPrivileges   :: [Text]
+                                , oauthUserInfoUnionID      :: Maybe WxppUnionID
+                                }
+                                deriving (Eq, Show, Typeable)
+$(deriveSafeCopy 0 'base ''OAuthGetUserInfoResult)
+
+instance FromJSON OAuthGetUserInfoResult where
+    parseJSON = withObject "OAuthGetUserInfoResult" $ \o -> do
+                    OAuthGetUserInfoResult
+                        <$> o .: "openid"
+                        <*> o .: "nickname"
+                        <*> (o .: "sex" >>= parseSexJson)
+                        <*> o .: "country"
+                        <*> o .: "province"
+                        <*> o .: "city"
+                        <*> (fmap UrlText . join . fmap emptyTextToNothing <$> o .:? "headimgurl")
+                        <*> o .: "privilege"
+                        <*> (fmap WxppUnionID . join . fmap emptyTextToNothing <$> o .:? "unionid")
+
+newtype WxppJsTicket = WxppJsTicket { unWxppJsTicket :: Text }
+                    deriving (Show, Read, Eq, Ord, Typeable)
+
+instance SafeCopy WxppJsTicket where
+    getCopy                  = contain $ WxppJsTicket <$> safeGet
+    putCopy (WxppJsTicket x) = contain $ safePut x
+    errorTypeName _          = "WxppJsTicket"
+
+instance PersistField WxppJsTicket where
+    toPersistValue      = toPersistValue . unWxppJsTicket
+    fromPersistValue    = fmap WxppJsTicket . fromPersistValue
+
+instance PersistFieldSql WxppJsTicket where
+    sqlType _ = SqlString
+
+instance ToJSON WxppJsTicket where
+    toJSON = toJSON . unWxppJsTicket
+
+instance FromJSON WxppJsTicket where
+    parseJSON = fmap WxppJsTicket . parseJSON
+
+instance PathPiece WxppJsTicket where
+    toPathPiece (WxppJsTicket x)  = toPathPiece x
+    fromPathPiece t             =   let t' = T.strip t
+                                    in if T.null t'
+                                          then Nothing
+                                          else WxppJsTicket <$> fromPathPiece t'
+
+
+-- | 程序内部因公众号的变化而产生的事件
+data WxppSignal = WxppSignalNewApp WxppAppID
+                | WxppSignalRemoveApp WxppAppID
+                deriving (Eq, Show)
 
 --------------------------------------------------------------------------------
 
@@ -1266,8 +1496,23 @@ wxppLogSource :: IsString a => a
 wxppLogSource = "WXPP"
 
 md5HashFile :: FilePath -> IO MD5Hash
-md5HashFile = fmap (MD5Hash . MD5.hashlazy) . LB.readFile . encodeString
+md5HashFile = fmap md5HashLBS . LB.readFile
+
+md5HashLBS :: LB.ByteString -> MD5Hash
+md5HashLBS = MD5Hash . MD5.hashlazy
+
+md5HashBS :: ByteString -> MD5Hash
+md5HashBS = MD5Hash . MD5.hash
+
+sha256HashFile :: FilePath -> IO SHA256Hash
+sha256HashFile = fmap sha256HashLBS . LB.readFile
+
+sha256HashLBS :: LB.ByteString -> SHA256Hash
+sha256HashLBS = SHA256Hash . SHA256.hashlazy
+
+sha256HashBS :: ByteString -> SHA256Hash
+sha256HashBS = SHA256Hash . SHA256.hash
 
 -- | 上传得到的 media id 只能用一段时间
 usableUploadResult :: UTCTime -> NominalDiffTime -> UploadResult -> Bool
-usableUploadResult now dt ur = addUTCTime dt (urCreateTime ur) < now
+usableUploadResult now dt ur = addUTCTime dt (urCreateTime ur) > now

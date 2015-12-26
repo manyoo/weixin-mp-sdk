@@ -16,6 +16,7 @@ import qualified Data.Text                  as T
 import qualified Data.ByteString.Base64     as B64
 import qualified Data.ByteString.Base64.URL as B64L
 import qualified Data.ByteString.Char8      as C8
+import Data.Time                            (addUTCTime)
 import Data.Aeson                           ( FromJSON(..)
                                             , withObject, (.:))
 import Crypto.Cipher                        ( makeIV, IV, cbcEncrypt
@@ -28,6 +29,7 @@ import Data.Byteable                        (toBytes)
 import qualified Data.Attoparsec.ByteString as AttoB
 
 import WeiXin.PublicPlatform.Types
+import WeiXin.PublicPlatform.Class
 import WeiXin.PublicPlatform.WS
 
 
@@ -69,6 +71,33 @@ refreshAccessToken' app_id app_secret = do
                 >>= asWxppWsResponseNormal'
     $(logDebugS) wxppLogSource $ "access token has been refreshed."
     return atk
+
+
+wxppAcquireAndSaveAccessToken :: (MonadIO m, MonadLogger m, MonadCatch m
+                                 , WxppCacheTokenUpdater c) =>
+                                c
+                                -> WxppAppID
+                                -> WxppAppSecret
+                                -> m ()
+wxppAcquireAndSaveAccessToken cache app_id secret = do
+    ws_res <- tryWxppWsResult $ refreshAccessToken' app_id secret
+    case ws_res of
+        Left err -> do
+            $(logErrorS) wxppLogSource $
+                "Failed to refresh access token for app: "
+                    <> unWxppAppID app_id
+                    <> ", error was: "
+                    <> fromString (show err)
+        Right (AccessTokenResp atk_p ttl) -> do
+            $(logDebugS) wxppLogSource $
+                "New access token acquired for app: "
+                    <> unWxppAppID app_id
+                    <> ", expired in: " <> (fromString $ show ttl)
+            now' <- liftIO getCurrentTime
+            let expiry = addUTCTime (fromIntegral ttl) now'
+            liftIO $ do
+                wxppCacheAddAccessToken cache (atk_p app_id) expiry
+                wxppCachePurgeAccessToken cache now'
 
 
 
@@ -126,7 +155,7 @@ wxppEncryptInternal2 ::
 wxppEncryptInternal2 app_id ak salt msg = do
     case makeIV iv_bs of
         Nothing -> do
-                -- $(logErrorS) wxppLogSource $ "cannot make IV"
+                --   $(logErrorS) wxppLogSource $ "cannot make IV"
                 Left $ "cannot make IV"
         Just iv -> do
                 return $ wxppEncryptInternal app_id ak iv salt msg
@@ -143,11 +172,19 @@ wxppEncrypt :: MonadIO m =>
 wxppEncrypt app_id ak msg = do
     -- 虽然文档没有写，看样子随机字串应该只能用安全的字符
     -- 使用 base64-url 编码一个完全字节流可以达到这个效果
-    let gen_len = salt_len  -- long enough
-        salt_len = 16
-    salt <- liftIO $ liftM (take salt_len . B64L.encode . B.pack) $ replicateM gen_len randomIO
+    let salt_len = 16
+    Nonce nonce <- liftIO $ wxppMakeNonce salt_len
+    let salt = encodeUtf8 nonce
     return $ (, salt) <$> wxppEncryptInternal2 app_id ak salt msg
 
+
+wxppMakeNonce :: MonadIO m
+                => Int
+                -> m Nonce
+wxppMakeNonce salt_len = liftIO $ do
+    let gen_len = salt_len  -- long enough
+    liftM (Nonce . fromString . C8.unpack . take salt_len . B64L.encode . B.pack) $
+        replicateM gen_len randomIO
 
 -- | 加密明文的入口: base64-encoded
 wxppEncryptB64 :: MonadIO m =>

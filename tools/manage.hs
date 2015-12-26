@@ -1,6 +1,6 @@
 module Main where
 
-import ClassyPrelude hiding ((<>), FilePath, (</>), (<.>))
+import ClassyPrelude hiding ((<>))
 import Control.Monad.Logger
 import Options.Applicative
 import Data.Aeson
@@ -10,7 +10,6 @@ import qualified Data.Yaml                  as Y
 import qualified Data.Text                  as T
 import qualified Data.Text.IO               as T
 import qualified Data.Map.Lazy              as LM
-import Filesystem.Path.CurrentOS            (FilePath)
 import Network.Mime                         (defaultMimeMap, MimeType)
 import System.IO                            (hFlush, openTempFile, readLn, hSeek, SeekMode(..))
 import System.Directory                     (getTemporaryDirectory, removeFile)
@@ -18,6 +17,7 @@ import System.Process                       (callProcess)
 import System.Environment                   (lookupEnv)
 import Data.List                            ((!!))
 import Data.Conduit
+import Data.List.NonEmpty                   (NonEmpty(..))
 import qualified Data.Conduit.List          as CL
 -- import Control.Monad.Reader                 (asks)
 
@@ -27,6 +27,7 @@ import WeiXin.PublicPlatform.AutoReplyRules
 import WeiXin.PublicPlatform.Menu
 import WeiXin.PublicPlatform.EndUser
 import WeiXin.PublicPlatform.Material
+import WeiXin.PublicPlatform.Propagate
 -- import WeiXin.PublicPlatform.WS
 import WeiXin.PublicPlatform.Security
 
@@ -50,6 +51,8 @@ data ManageCmd = QueryAutoReplyRules
                 | RenameGroup WxppUserGroupID Text
                 | GroupOfUser WxppOpenID
                 | SetUserGroup WxppUserGroupID [WxppOpenID]
+                | GetPropagateMsgStatus PropagateMsgID
+                | PropagateDurableNews WxppDurableMediaID
                 deriving (Show, Eq, Ord)
 
 
@@ -130,6 +133,19 @@ manageCmdParser = subparser $
                             )
                 )
             (progDesc "移动用户至指定分组"))
+    <> command "get-propagate-msg-status"
+        (info (helper <*> ( GetPropagateMsgStatus
+                                <$> (fmap PropagateMsgID $ argument auto (metavar "MSG_ID"))
+                            )
+            )
+            (progDesc "查询群发消息的发送状态"))
+    <> command "propagate-durable-news"
+        (info (helper <*> ( PropagateDurableNews
+                                <$> (fmap (WxppDurableMediaID . fromString) $
+                                        argument str (metavar "MEDIA_ID"))
+                            )
+            )
+            (progDesc "群发永久图文素材"))
 
 
 mediaTypeReader ::
@@ -221,7 +237,7 @@ start = do
 
         LoadMenu fp -> do
             atk <- get_atk
-            result <- wxppCreateMenuWithYaml atk fp
+            result <- wxppCreateMenuWithYaml atk ("." :| []) fp
             case result of
                 Left err -> do
                     $logError $ fromString $
@@ -250,12 +266,12 @@ start = do
                         , "download_url"    .= unUrlText down_url
                         ]
 
-                WxppGetDurableRaw mime bs -> do
-                    let ext = fromMaybe "dat" $ extByMime mime
+                WxppGetDurableRaw m_mime bs -> do
+                    let ext = fromMaybe "dat" $ join $ fmap extByMime m_mime
                         fn  = unWxppDurableMediaID mid <> "." <> ext
                     liftIO $ do
                         putStr "Content-Type: "
-                        B.putStr mime
+                        B.putStr $ fromMaybe "" m_mime
                         putStrLn ""
                         LB.writeFile (T.unpack fn) bs
                         putStrLn $ "Saved to file: " <> fn
@@ -314,7 +330,7 @@ start = do
             atk <- get_atk
             let has_keyword item =
                     let articles = wxppBatchGetDurableNewsItemContent item
-                    in any (T.isInfixOf keyword . wxppDurableArticleTitle) articles
+                    in any (T.isInfixOf keyword . wxppDurableArticleTitle . wxppDurableArticleSA) articles
 
             results <- wxppBatchGetDurableToSrc (wxppBatchGetDurableNews atk 20)
                 $= (awaitForever $ \x -> do
@@ -337,9 +353,18 @@ start = do
                 else do
                     mapM_ (liftIO . B.putStr . Y.encode) results
 
+        GetPropagateMsgStatus msg_id -> do
+            atk <- get_atk
+            PropagateMsgStatus status <- wxppGetPropagateMsgStatus atk msg_id
+            putStrLn status
+
+        PropagateDurableNews media_id -> do
+            atk <- get_atk
+            msg_id <- wxppPropagateMsg atk Nothing (WxppPropagateMsgNews $ fromWxppDurableMediaID media_id)
+            putStrLn $ fromString $ show msg_id
 
 editNewsDurable :: (MonadIO m, MonadLogger m, MonadCatch m) =>
-    AccessToken -> WxppDurableMediaID -> [WxppDurableArticle] -> m ()
+    AccessToken -> WxppDurableMediaID -> [WxppDurableArticleS] -> m ()
 editNewsDurable atk mid articles = do
     let go bs = do
             bs' <- liftIO $ editWithEditor bs
@@ -354,9 +379,11 @@ editNewsDurable atk mid articles = do
                         then go bs'
                         else return ()
 
-                Right new_articles -> do
+                Right new_articles0 -> do
+                    let new_articles = map wxppDurableArticleSA new_articles0
+                        old_articles = map wxppDurableArticleSA articles
                     let old_len = length articles
-                    forM_ (zip [0..old_len] $ zip articles new_articles) $ \(idx, (old_a, article)) -> do
+                    forM_ (zip [0..old_len] $ zip old_articles new_articles) $ \(idx, (old_a, article)) -> do
                         when (old_a /= article) $ do
                             wxppReplaceArticleOfDurableNews atk mid idx article
 

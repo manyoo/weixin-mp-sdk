@@ -1,61 +1,21 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE CPP #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ViewPatterns #-}
 module WeiXin.PublicPlatform.Yesod.Site.Data where
 
 import ClassyPrelude
+import qualified Data.ByteString.Lazy       as LB
 import Yesod
-import Database.Persist.Quasi
 import Control.Monad.Logger
-import Network.Wai                          (Request)
-import Data.Bits                            ((.&.))
-import Network.Socket                       (SockAddr(..))
-import Network.Wai                          (remoteHost)
 import Data.Aeson
 import Data.Default
 
-import Database.Persist.Sql
-
-import WeiXin.PublicPlatform.Security
+import WeiXin.PublicPlatform.Class
 import WeiXin.PublicPlatform.InMsgHandler
+import WeiXin.PublicPlatform.Yesod.Types
+import WeiXin.PublicPlatform.Yesod.Model
 
-
-wxppSubModelsDef ::
-#if MIN_VERSION_persistent(2, 0, 0)
-    [EntityDef]
-#else
-    [EntityDef SqlType]
-#endif
-wxppSubModelsDef = $(persistFileWith lowerCaseSettings "models")
-
-share [mkPersist sqlSettings, mkMigrate "migrateAllWxppSubModels"]
-                    $(persistFileWith lowerCaseSettings "models")
-
-
--- | 判断 WAI 请求是否来自可信的来源
--- 有若干 web 接口是打算暴露给同伴使用的
--- 这个函数负责检查这些请求是否可以执行
-type RequestAuthChecker = Request -> IO Bool
-
-alwaysDenyRequestAuthChecker :: RequestAuthChecker
-alwaysDenyRequestAuthChecker _ = return False
-
--- | 总是通过检查
--- 使用这个函数意味着系统有其它手段作安全限制
-alwaysAllowRequestAuthChecker :: RequestAuthChecker
-alwaysAllowRequestAuthChecker _ = return True
-
-loopbackOnlyRequestAuthChecker :: RequestAuthChecker
-loopbackOnlyRequestAuthChecker req = return $ isLoopbackSockAddr $ remoteHost req
-
-isLoopbackSockAddr :: SockAddr -> Bool
-isLoopbackSockAddr addr =
-    case addr of
-        SockAddrInet _ w        -> w .&. 0xFF  == 127
-        SockAddrInet6 _ _ w _   -> w == (0, 0, 0, 1)
-        _                       -> False
 
 
 data WxppSubsiteOpts = WxppSubsiteOpts {
@@ -88,18 +48,19 @@ data WxppSub =
         WxppSub {
                 wxppSubAppConfig        :: WxppAppConfig
                     -- ^ 所有配置信息
-                , wxppSubCacheBackend   :: SomeWxppCacheBackend
-                , wxppSubRunDBAction    ::
-                                        -- XXX: 这里写死两个事实
-                                        -- * persistent 版本要 2.0
-                                        -- * 只能是 SQL 类型数据库
-                                        forall a m. (MonadIO m, MonadBaseControl IO m) =>
-                                                        SqlPersistT m a -> m a
-                    -- ^ execute any DB actions
-                , wxppSubSendOutMsgs    :: [WxppOutMsgEntity] -> IO ()
+                , wxppSubCacheBackend   :: SomeWxppCacheClient
+                , wxppSubRunDBAction    :: WxppDbRunner -- ^ execute any DB actions
+                , wxppSubSendOutMsgs    :: [(WxppOpenID, WxppOutMsg)] -> IO ()
                     -- ^ a computation to send outgoing messages
-                , wxppSubMsgHandler     :: WxppInMsgHandler (LoggingT IO)
-                , wxppSubMsgMiddlewares :: [SomeWxppInMsgProcMiddleware (LoggingT IO)]
+                , wxppSubMsgHandler     :: WxppInMsgHandler IO
+                , wxppPreProcessInMsg   :: ( LB.ByteString
+                                                -- ^ raw data of message (unparsed)
+                                            -> Maybe WxppInMsgEntity
+                                                -- ^ this is nothing only if caller cannot parse the message
+                                            -> IO (Either String
+                                                    (Maybe (LB.ByteString, Maybe WxppInMsgEntity))
+                                                    )
+                                            )
                 , wxppSubRunLoggingT    :: forall a m. LoggingT m a -> m a
                 , wxppSubOptions        :: WxppSubsiteOpts
                 }
@@ -114,6 +75,8 @@ newtype MaybeWxppSub = MaybeWxppSub { unMaybeWxppSub :: IO (Maybe WxppSub) }
 
 mkYesodSubData "MaybeWxppSub" [parseRoutes|
 /msg                        MessageR            GET POST
+/p/oauth/callback           OAuthCallbackR      GET
+/p/oauth/test               OAuthTestR          GET
 -- 修改以下的路径，记得修改 WeiXin.PublicPlatform.Center 里的相应路径
 /x/atk                      GetAccessTokenR     GET
 /x/union_id/#WxppOpenID     GetUnionIDR         GET

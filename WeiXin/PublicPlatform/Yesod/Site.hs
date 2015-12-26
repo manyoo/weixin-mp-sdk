@@ -14,14 +14,22 @@ import qualified Data.ByteString.Base16     as B16
 import qualified Data.ByteString.Base64.URL as B64L
 import qualified Data.ByteString.Char8      as C8
 import qualified Data.Text                  as T
+import qualified Data.Set                   as Set
 import Control.Monad.Trans.Except           (runExceptT, ExceptT(..), throwE)
 import Control.Concurrent.Async             (async)
 import Control.Concurrent                   (threadDelay, forkIO)
+import Control.Monad.Trans.Maybe            (runMaybeT, MaybeT(..))
+import Network.URI                          ( parseURI, uriQuery, uriToString )
+import Network.HTTP                         ( urlEncode )
+import Yesod.Default.Util                   ( widgetFileReload )
+import Data.Time                            ( addUTCTime )
 
 import Yesod.Helpers.Handler                ( httpErrorWhenParamError
                                             , reqGetParamE'
                                             , paramErrorFromEither
                                             , httpErrorRetryWithValidParams
+                                            , reqPathPieceParamPostGet
+                                            , getCurrentUrl
                                             )
 import Yesod.Helpers.Logger
 import Control.Monad.Logger
@@ -41,25 +49,25 @@ import qualified Data.Aeson                 as A
 
 import Database.Persist.Sql
 
-import Text.Blaze.Svg.Renderer.Utf8 (renderSvg)   -- blaze-svg
-import qualified Data.QRCode as QR                -- haskell-qrencode
-import qualified Diagrams.Backend.SVG as D        -- diagrams-svg
-import qualified Diagrams.Prelude as D            -- diagrams-lib
-import qualified Diagrams.QRCode as QR            -- diagrams-qrcode
-
+import WeiXin.PublicPlatform.Yesod.Types    (handlerGetWeixinClientVersion)
+import WeiXin.PublicPlatform.Yesod.Model
 import WeiXin.PublicPlatform.Yesod.Site.Data
+import WeiXin.PublicPlatform.Class
 import WeiXin.PublicPlatform.Security
 import WeiXin.PublicPlatform.Message
 import WeiXin.PublicPlatform.Error
 import WeiXin.PublicPlatform.WS
 import WeiXin.PublicPlatform.EndUser
 import WeiXin.PublicPlatform.QRCode
-import WeiXin.PublicPlatform.InMsgHandler
+import WeiXin.PublicPlatform.OAuth
+import WeiXin.PublicPlatform.Utils
 
 
-withWxppSubHandler ::
-    (WxppSub -> HandlerT MaybeWxppSub (HandlerT master IO) a)
-    -> HandlerT MaybeWxppSub (HandlerT master IO) a
+withWxppSubHandler :: ( MonadHandler m, HandlerSite m ~ MaybeWxppSub
+                    , MonadBaseControl IO m
+                    )
+                    => (WxppSub -> m a)
+                    -> m a
 withWxppSubHandler f = do
     getYesod
         >>= liftIO . unMaybeWxppSub
@@ -141,24 +149,21 @@ postMessageR = withWxppSubHandler $ \foundation -> withWxppSubLogging foundation
                         return Nothing
                     Right x -> return $ Just x
 
-        pre_result <- liftIO $ wxppSubRunLoggingT foundation $
-                        preProcessInMsgByMiddlewares
-                            (wxppSubMsgMiddlewares foundation)
-                            (wxppSubCacheBackend foundation)
-                            decrypted_xml0 m_ime0
+        pre_result <- liftIO $ wxppPreProcessInMsg foundation decrypted_xml0 m_ime0
         case pre_result of
-            Nothing -> do
+            Left err -> do
+                $logErrorS wxppLogSource $ "wxppPreProcessInMsg failed: " <> fromString err
+                return ("程序内部错误，请稍后重试", [])
+
+            Right Nothing -> do
                 $logDebugS wxppLogSource $ "message handle skipped because middleware return Nothing"
                 return ("", [])
 
-            Just (decrypted_xml, m_ime) -> do
+            Right (Just (decrypted_xml, m_ime)) -> do
                 let handle_msg      = wxppSubMsgHandler foundation
                 out_res <- ExceptT $
-                        (try $ liftIO $ wxppSubRunLoggingT foundation $ handle_msg decrypted_xml m_ime)
-                            >>= return
-                                    . either
-                                        (Left . (show :: SomeException -> String))
-                                        id
+                        (tryAny $ liftIO $ handle_msg decrypted_xml m_ime)
+                            >>= return . either (Left . show) id
 
                 case m_ime of
                     Nothing -> do
@@ -188,7 +193,7 @@ postMessageR = withWxppSubHandler $ \foundation -> withWxppSubLogging foundation
                                                     my_name
                                                     now
                                                     x
-                        liftM (, map mk_out_msg_entity other_out_msgs) $
+                        liftM (, map (user_open_id,) other_out_msgs) $
                             fmap (fromMaybe "") $ forM m_resp_out_msg $ \out_msg -> do
                                 liftM (LT.toStrict . renderText def) $ do
                                     let out_msg_entity = mk_out_msg_entity out_msg
@@ -218,6 +223,163 @@ postMessageR = withWxppSubHandler $ \foundation -> withWxppSubLogging foundation
         parse_xml_lbs x  = case parseLBS def x of
                                 Left ex     -> Left $ "Failed to parse XML: " <> show ex
                                 Right xdoc  -> return xdoc
+
+
+wxppOAuthLoginRedirectUrl :: (MonadHandler m, MonadIO m)
+                        => (Route MaybeWxppSub -> [(Text, Text)] -> IO Text)
+                        -> WxppAppID
+                        -> OAuthScope
+                        -> Text             -- ^ optional state: 测试表达微信总是传回一个 state 参数
+                                            -- 就算我们我们不传给它 state 参数
+                                            -- 所以 state 参数不用 Maybe Text 表达
+                        -> UrlText          -- ^ return URL
+                        -> m UrlText
+wxppOAuthLoginRedirectUrl url_render_io app_id scope state return_url = do
+    oauth_retrurn_url <- liftIO $ liftM UrlText $
+                            url_render_io OAuthCallbackR [ ("return", unUrlText return_url) ]
+    let auth_url = wxppOAuthRequestAuth app_id scope
+                        oauth_retrurn_url
+                        state
+    return auth_url
+
+sessionKeyWxppUser :: WxppAppID -> Text
+sessionKeyWxppUser app_id = "wxpp|" <> unWxppAppID app_id
+
+sessionKeyWxppOAuthState :: WxppAppID -> Text
+sessionKeyWxppOAuthState app_id = "wxpp-oauth-st|" <> unWxppAppID app_id
+
+sessionMarkWxppUser :: MonadHandler m
+                    => WxppAppID
+                    -> WxppOpenID
+                    -> Text
+                    -> m ()
+sessionMarkWxppUser app_id open_id state = do
+    setSession (sessionKeyWxppUser app_id) (unWxppOpenID open_id)
+    let st_key = sessionKeyWxppOAuthState app_id
+    if T.null state
+        then deleteSession st_key
+        else setSession st_key state
+
+sessionGetWxppUser :: MonadHandler m
+                    => WxppAppID
+                    -> m (Maybe (WxppOpenID, Text))
+sessionGetWxppUser app_id = runMaybeT $ do
+    (,) <$> ( fmap WxppOpenID $ MaybeT $ lookupSession (sessionKeyWxppUser app_id) )
+        <*> ( liftM (fromMaybe "") $ lift $ lookupSession (sessionKeyWxppOAuthState app_id))
+
+getOAuthCallbackR :: Yesod master => HandlerT MaybeWxppSub (HandlerT master IO) Html
+getOAuthCallbackR = withWxppSubHandler $ \sub -> do
+    m_code <- lookupGetParam "code"
+    return_url <- reqPathPieceParamPostGet "return"
+    state <- liftM (fromMaybe "") $ lookupGetParam "state"
+    let wac    = wxppSubAppConfig sub
+        app_id = wxppConfigAppID wac
+        secret = wxppConfigAppSecret wac
+        cache  = wxppSubCacheBackend sub
+    case fmap OAuthCode m_code of
+        Just code -> do
+            -- 用户同意授权
+            err_or_atk_info <- tryWxppWsResult $ wxppOAuthGetAccessToken app_id secret code
+            atk_info <- case err_or_atk_info of
+                            Left err -> do
+                                $logErrorS wxppLogSource $
+                                    "wxppOAuthGetAccessToken failed: " <> tshow err
+                                throwM $ HCError NotAuthenticated
+
+                            Right x -> return x
+
+            now <- liftIO getCurrentTime
+            let expiry  = addUTCTime (oauthAtkTTL atk_info) now
+                open_id = oauthAtkOpenID atk_info
+                atk_p   = OAuthAccessTokenPkg
+                            (oauthAtkToken atk_info)
+                            (oauthAtkRefreshToken atk_info)
+                            (oauthAtkScopes atk_info)
+                            state
+                            open_id
+                            app_id
+
+            liftIO $ wxppCacheAddOAuthAccessToken cache atk_p expiry
+
+            sessionMarkWxppUser app_id open_id state
+
+            let rdr_url = case parseURI return_url of
+                    Just uri ->
+                                let qs = uriQuery uri
+                                    qs' = case qs of
+                                            _   | null qs   -> qs ++ "?"
+                                                | qs == "?" -> qs
+                                                | otherwise -> qs ++ "&"
+                                    new_uri = uri { uriQuery =
+                                                        qs' ++ "state=" ++ urlEncode (T.unpack state)
+                                                    }
+                                in uriToString id new_uri ""
+
+                    _ -> return_url
+
+            -- $logDebugS wxppLogSource $ "redirecting to: " <> T.pack rdr_url
+            redirect rdr_url
+
+        Nothing -> do
+            -- 授权失败
+            defaultLayoutSub $ do
+                $(widgetFileReload def "oauth/user_denied")
+
+
+-- | 测试是否已经过微信用户授权，是则执行执行指定的函数
+-- 否则重定向至微信授权页面，待用户授权成功后再重定向回到当前页面
+wxppOAuthHandler :: (MonadHandler m, MonadIO m, MonadBaseControl IO m
+                , WxppCacheTokenReader c, WxppCacheTemp c)
+                => c
+                -> (Route MaybeWxppSub -> [(Text, Text)] -> IO Text)
+                -> WxppAppID
+                -> OAuthScope
+                -> Text         -- ^ 调用 oauth 接口的 state 参数（初始值）
+                                -- 但真正传给 'f' 的 state 在 OAuthAccessTokenPkg 里
+                                -- 未必与前者相同
+                -> ( OAuthAccessTokenPkg -> m a )
+                -> m a
+wxppOAuthHandler cache render_url_io app_id scope state f = do
+    m_atk_p <- wxppOAuthHandlerGetAccessTokenPkg cache app_id scope
+    case m_atk_p of
+        Nothing -> do
+            is_wx <- isJust <$> handlerGetWeixinClientVersion
+            unless is_wx $ do
+                permissionDenied "请用在微信里打开此网页"
+            url <- getCurrentUrl
+            wxppOAuthLoginRedirectUrl render_url_io app_id scope state (UrlText url)
+                >>= redirect . unUrlText
+        Just atk_p -> f atk_p
+
+
+wxppOAuthHandlerGetAccessTokenPkg :: (MonadHandler m, MonadIO m, MonadBaseControl IO m
+                                    , WxppCacheTokenReader c, WxppCacheTemp c)
+                                    => c
+                                    -> WxppAppID
+                                    -> OAuthScope
+                                    -> m (Maybe OAuthAccessTokenPkg)
+wxppOAuthHandlerGetAccessTokenPkg cache app_id scope = do
+    m_oauth_st <- sessionGetWxppUser app_id
+    case m_oauth_st of
+        Nothing -> return Nothing
+        Just (open_id, state2) -> do
+            m_atk_info <- liftIO $ wxppCacheGetOAuthAccessToken cache
+                                        app_id open_id (Set.singleton scope) state2
+            case m_atk_info of
+                Nothing         -> return Nothing
+                Just atk_info   -> return $ Just (packOAuthTokenInfo app_id open_id atk_info)
+
+-- | 演示/测试微信 oauth 授权的页面
+getOAuthTestR :: Yesod master => HandlerT MaybeWxppSub (HandlerT master IO) Text
+getOAuthTestR = withWxppSubHandler $ \sub -> do
+    let wac    = wxppSubAppConfig sub
+        app_id = wxppConfigAppID wac
+    m_oauth_st <- sessionGetWxppUser app_id
+    case m_oauth_st of
+        Nothing -> return "no open id, authorization failed"
+        Just (open_id, state) -> return $
+                            "Your open id is: " <> unWxppOpenID open_id
+                                <> ", state is: " <> state
 
 
 checkWaiReqThen :: Yesod master =>
@@ -292,7 +454,7 @@ getInitCachedUsersR = checkWaiReqThen $ \foundation -> do
     atk <- getAccessTokenSubHandler' foundation
 
     _ <- liftIO $ forkIO $ wxppSubRunLoggingT foundation $ do
-                _ <- wxppSubRunDBAction foundation $ initWxppUserDbCacheOfApp atk
+                _ <- runWxppDB (wxppSubRunDBAction foundation) $ initWxppUserDbCacheOfApp atk
                 return ()
 
     return $ toJSON ("run in background" :: Text)
@@ -354,9 +516,7 @@ getShowSimulatedQRCodeR = do
 
     let scene = fst ticket
     let input = C8.unpack $ LB.toStrict $ A.encode scene
-    qrcode <- liftIO $ QR.encodeString input Nothing QR.QR_ECLEVEL_M QR.QR_MODE_EIGHT True
-    let dia = D.scale 6 $ QR.stroke $ QR.pathMatrix $ QR.toMatrix qrcode
-        bs = renderSvg $ D.renderDia D.SVG (D.SVGOptions D.Absolute Nothing) dia
+    bs <- encodeStringQRCodeJpeg 5 input
     return $ toTypedContent (typeSvg, toContent bs)
 
 
@@ -422,7 +582,7 @@ fakeUnionID (WxppOpenID x) = WxppUnionID $ "fu_" <> x
 -- | initialize db table: WxppUserCachedInfo
 initWxppUserDbCacheOfApp ::
     ( MonadIO m, MonadLogger m, MonadThrow m) =>
-    AccessToken -> SqlPersistT m Int
+    AccessToken -> ReaderT WxppDbBackend m Int
 initWxppUserDbCacheOfApp atk = do
     wxppGetEndUserSource atk
         =$= CL.concatMap wxppOpenIdListInGetUserResult

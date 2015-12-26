@@ -53,13 +53,25 @@ WxppUserCachedInfo
     UniqueWxppUserCachedInfo openId app
 
 
--- | Access Token 的缓存表
--- 如果不使用数据库实现缓存，则此表无用
-WxppCachedAccessToken
+WxppCachedSnsUserInfo
     app                 WxppAppID maxlen=200
-    data                Text
-    expiryTime          UTCTime
-    createdTime         UTCTime
+    openId              WxppOpenID maxlen=200
+    unionId             WxppUnionID Maybe maxlen=200
+    lang                Lang maxlen=200
+
+    gender              Gender Maybe
+    nickname            Text
+    country             CountryName
+    province            ProvinceName
+    city                CityName
+    headImgUrl          UrlText Maybe maxlen=200
+    privileges          [Text]
+
+    updatedTime         UTCTime
+
+    UniqueWxppCachedSnsUserInfo app openId lang
+    UniqueWxppCachedSnsUserInfo2 app unionId lang !force
+
 
 -- | 缓存用户信息
 -- 如果不使用数据库实现缓存，则此表无用
@@ -86,11 +98,27 @@ WxppCachedUserInfoExt
 
 WxppCachedUploadedMedia
     app                 WxppAppID maxlen=200
-    md5                 MD5Hash maxlen=200
+    sha256              SHA256Hash maxlen=200
     mediaType           WxppMediaType maxlen=200
     mediaId             WxppBriefMediaID maxlen=200
     createdTime         UTCTime
 
     UniqueWxppCachedUploadedMedia mediaId app
-    UniqueWxppCachedUploadedMediaHash md5 app
+    UniqueWxppCachedUploadedMediaHash sha256 app
 
+
+-- | 管理公众号中的会话状态
+-- 对于每个用户，都找相应的最新的记录
+-- 如果要表达中止会话，则应把 aborted 设为 true
+-- NEED INDEX: updatedTime
+WxppTalkState
+    appId           WxppAppID maxlen=200
+    openId          WxppOpenID maxlen=200
+    typ             Text
+    json            ByteString          -- ^ 这个内容的解释依赖 typ 字段
+
+    done            Bool
+    aborted         Bool
+
+    updatedTime     UTCTime
+    createdTime     UTCTime

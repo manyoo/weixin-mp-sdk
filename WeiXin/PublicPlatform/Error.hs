@@ -13,7 +13,13 @@ data WxppError = WxppServerBusy
                 | WxppInvalidTokenType
                 | WxppInvalidOpenID
                 | WxppInvalidMediaFileType
+                | WxppInvalidMediaId
                 | WxppInvalidAppID
+                | WxppSubscriberRequired
+                | WxppApiCallQuotaExceeded
+                | WxppReplyIsTooLate
+                | WxppNoMassSendQuota   -- ^ "has no masssend quota
+                                        -- 不在文档里，但如果群发数量超限额就会出这个错
                 | WxppSystemError
                 deriving (Show, Typeable, Eq, Ord, Enum, Bounded)
 
@@ -24,8 +30,13 @@ wxppToErrorCode WxppInvalidAppSecret        = 40001
 wxppToErrorCode WxppInvalidTokenType        = 40002
 wxppToErrorCode WxppInvalidOpenID           = 40003
 wxppToErrorCode WxppInvalidMediaFileType    = 40004
+wxppToErrorCode WxppInvalidMediaId          = 40007
 wxppToErrorCode WxppInvalidAppID            = 40013
 wxppToErrorCode WxppInvalidAccessToken      = 40014
+wxppToErrorCode WxppSubscriberRequired      = 43005
+wxppToErrorCode WxppApiCallQuotaExceeded    = 45009
+wxppToErrorCode WxppReplyIsTooLate          = 45015
+wxppToErrorCode WxppNoMassSendQuota         = 45028
 wxppToErrorCode WxppSystemError             = 61450
 
 
